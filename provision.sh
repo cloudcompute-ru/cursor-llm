@@ -42,7 +42,31 @@ MODEL_ID="${MODEL_ID:-Qwen/Qwen2.5-Coder-32B-Instruct-AWQ}"
 # switching the underlying MODEL_ID later doesn't break user-saved Cursor
 # settings.
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen-2.5-coder-32b}"
+
+# Public port — what cloudflared exposes and what Cursor talks to.
+# This is NOT vLLM directly: it's the small proxy.py shipped with
+# this repo, which sits in front of vLLM and rewrites
+# /v1/models.max_model_len to a smaller advertised value (see the
+# "Cursor max_model_len overshoot" block below).
 VLLM_PORT="${VLLM_PORT:-8000}"
+
+# Internal port vLLM actually binds. The proxy forwards to here.
+# Customers never see this port — it's not in the cloudflared config
+# and not in the docker port-map (cf. cursor-llm template; only
+# VLLM_PORT is exposed).
+VLLM_INTERNAL_PORT="${VLLM_INTERNAL_PORT:-8001}"
+
+# Value the proxy reports for `max_model_len` in /v1/models.
+# Cursor clamps prompt+history+system to this and consistently
+# overshoots by exactly +1 token (its tokenizer disagrees with
+# Qwen's by 1 on the assistant message wrappers). With vLLM
+# accepting up to MAX_MODEL_LEN (16k or 65k below) and the proxy
+# advertising this value, Cursor effectively gets a hard cap that
+# always leaves headroom, no matter how aggressive its codebase
+# context indexer is. 60000 leaves ~5500 tokens of safety on the
+# 65k-extended path (40 GiB+ GPU); on a 24 GiB GPU we override this
+# to ~14000 below to match the smaller real cap.
+ADVERTISED_MAX_MODEL_LEN="${ADVERTISED_MAX_MODEL_LEN:-60000}"
 
 # vLLM `--max-model-len` cap on per-request prompt+completion tokens.
 # Chosen by GPU VRAM since Cursor (especially Composer / Agent) keeps
@@ -83,9 +107,18 @@ fi
 if [ "${GPU_VRAM_MB:-0}" -ge 38000 ]; then
     MAX_MODEL_LEN_DEFAULT=65536
     YARN_NEEDED=1
+    # Already-set ADVERTISED_MAX_MODEL_LEN default of 60000 is the
+    # right call here.
 else
     MAX_MODEL_LEN_DEFAULT=16384
     YARN_NEEDED=0
+    # On 24 GiB cards we never extended; advertise a value just
+    # below 16384 so Cursor's +1 overshoot still fits. 14000 leaves
+    # ~2400 tokens of safety, generous for the cl100k-vs-Qwen
+    # tokenizer drift Cursor's exhibited.
+    if [ -z "${ADVERTISED_MAX_MODEL_LEN_OVERRIDE:-}" ]; then
+        ADVERTISED_MAX_MODEL_LEN=14000
+    fi
 fi
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-$MAX_MODEL_LEN_DEFAULT}"
 
@@ -256,13 +289,17 @@ if ! [ -x "$CLOUDFLARED_BIN" ]; then
     chmod +x "$CLOUDFLARED_BIN"
 fi
 
-# Kill any pre-existing process holding VLLM_PORT — the upstream Vast vllm
-# template autostarts its own vLLM with a default model on first boot
-# (DeepSeek-R1-Distill-Llama-8B at the time of writing). Without this we'd
-# fail to bind 8000 and spend ages debugging. fuser exits non-zero when
-# nothing's bound, hence the `|| true`.
+# Kill any pre-existing process holding the public VLLM_PORT — the
+# upstream Vast vllm template autostarts its own vLLM with a default
+# model on first boot (DeepSeek-R1-Distill-Llama-8B at the time of
+# writing). Without this we'd fail to bind 8000 and spend ages
+# debugging. fuser exits non-zero when nothing's bound, hence the
+# `|| true`. Same for the internal port the new vLLM will own; if a
+# previous run left a zombie, this is where we sweep it.
 log "freeing port ${VLLM_PORT} if held by another process"
 fuser -k "${VLLM_PORT}/tcp" 2>/dev/null || true
+log "freeing internal port ${VLLM_INTERNAL_PORT} if held by another process"
+fuser -k "${VLLM_INTERNAL_PORT}/tcp" 2>/dev/null || true
 sleep 2
 
 # --- stage 2: download_model ---------------------------------------------
@@ -327,7 +364,7 @@ report_stage start_server
 #       downside for non-Agent users.
 nohup vllm serve "$MODEL_ID" \
     --host 0.0.0.0 \
-    --port "$VLLM_PORT" \
+    --port "$VLLM_INTERNAL_PORT" \
     --api-key "$API_KEY" \
     --served-model-name "$SERVED_MODEL_NAME" \
     --max-model-len "$MAX_MODEL_LEN" \
@@ -339,17 +376,18 @@ nohup vllm serve "$MODEL_ID" \
     > "$VLLM_LOG" 2>&1 &
 VLLM_PID=$!
 
-# Wait for vLLM to bind the port. Loading + quantizing 32B AWQ + warming
-# the kernel takes 60-180s on a 4090. Bail early if the process dies.
+# Wait for vLLM to bind its INTERNAL port. Loading + quantizing 32B
+# AWQ + warming the kernel takes 60-180s on a 4090. Bail early if
+# the process dies.
 VLLM_BIND_TIMEOUT_S=300
 for _ in $(seq 1 "$VLLM_BIND_TIMEOUT_S"); do
-    if curl -fsS --max-time 1 "http://127.0.0.1:${VLLM_PORT}/v1/models" \
+    if curl -fsS --max-time 1 "http://127.0.0.1:${VLLM_INTERNAL_PORT}/v1/models" \
         -H "Authorization: Bearer ${API_KEY}" >/dev/null 2>&1; then
-        log "vLLM ready on port ${VLLM_PORT}"
+        log "vLLM ready on internal port ${VLLM_INTERNAL_PORT}"
         break
     fi
     if ! kill -0 "$VLLM_PID" 2>/dev/null; then
-        log "vLLM exited before binding port ${VLLM_PORT}"
+        log "vLLM exited before binding port ${VLLM_INTERNAL_PORT}"
         tail_msg="$(json_escape "$(tail -c 500 "$VLLM_LOG")")"
         report_stage start_server "\"message\":\"vLLM crashed during startup: ${tail_msg}\""
         exit 1
@@ -359,6 +397,69 @@ done
 
 if ! kill -0 "$VLLM_PID" 2>/dev/null; then
     report_stage start_server "\"message\":\"vLLM died before completing startup\""
+    exit 1
+fi
+
+# --- stage 3.5: start_proxy ----------------------------------------------
+#
+# Tiny stdlib-only HTTP proxy (proxy.py, shipped alongside this script
+# in the cursor-llm repo). Sits between cloudflared and vLLM. Forwards
+# everything as-is, except GET /v1/models — there it rewrites
+# `max_model_len` to ADVERTISED_MAX_MODEL_LEN so Cursor caps its
+# prompt at a value that always leaves headroom against the real
+# limit. Without this, Cursor's tokenizer drift (cl100k vs Qwen) hits
+# vLLM's actual ceiling +1 every single request.
+#
+# Same Github source we use for provision.sh — we already exported
+# CC_PROVISION_URL_RAW from the onstart wrapper, so we can derive the
+# proxy.py URL by string-replace. If the env var isn't set (e.g.
+# someone running this script manually) fall back to main.
+
+PROXY_LOG="${LOG_DIR}/cc-proxy.log"
+PROXY_BIN="${WORKDIR}/cc-proxy.py"
+
+if [ -n "${CC_PROVISION_URL_RAW:-}" ]; then
+    PROXY_URL="${CC_PROVISION_URL_RAW%/provision.sh}/proxy.py"
+else
+    PROXY_URL="https://raw.githubusercontent.com/cloudcompute-ru/cursor-llm/main/proxy.py"
+fi
+
+log "fetching proxy.py from $PROXY_URL"
+if ! curl -fsSL "$PROXY_URL" -o "$PROXY_BIN"; then
+    report_stage start_server "\"message\":\"failed to fetch proxy.py from $PROXY_URL\""
+    exit 1
+fi
+chmod +x "$PROXY_BIN"
+
+log "starting cc-proxy on :${VLLM_PORT} → 127.0.0.1:${VLLM_INTERNAL_PORT} (advertise max_model_len=${ADVERTISED_MAX_MODEL_LEN})"
+nohup python3 "$PROXY_BIN" \
+    --listen-port "$VLLM_PORT" \
+    --upstream-port "$VLLM_INTERNAL_PORT" \
+    --advertised-max-model-len "$ADVERTISED_MAX_MODEL_LEN" \
+    > "$PROXY_LOG" 2>&1 &
+PROXY_PID=$!
+
+# Wait for the proxy to bind. It should come up in <1 s — anything
+# longer means a fatal port conflict or a Python import error in the
+# proxy script itself.
+PROXY_BIND_TIMEOUT_S=15
+for _ in $(seq 1 "$PROXY_BIND_TIMEOUT_S"); do
+    if curl -fsS --max-time 1 "http://127.0.0.1:${VLLM_PORT}/v1/models" \
+        -H "Authorization: Bearer ${API_KEY}" >/dev/null 2>&1; then
+        log "cc-proxy ready on port ${VLLM_PORT}"
+        break
+    fi
+    if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+        log "cc-proxy exited before binding"
+        tail_msg="$(json_escape "$(tail -c 400 "$PROXY_LOG")")"
+        report_stage start_server "\"message\":\"cc-proxy crashed: ${tail_msg}\""
+        exit 1
+    fi
+    sleep 1
+done
+
+if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    report_stage start_server "\"message\":\"cc-proxy died before completing startup\""
     exit 1
 fi
 
@@ -521,5 +622,5 @@ log "provisioning complete"
 log "  tunnel: ${TUNNEL_URL}"
 log "  api key: ${API_KEY}"
 log "  model name: ${SERVED_MODEL_NAME}"
-log "vLLM PID: ${VLLM_PID}; cloudflared PID: ${TUNNEL_PID}"
+log "vLLM PID: ${VLLM_PID}; cc-proxy PID: ${PROXY_PID:-?}; cloudflared PID: ${TUNNEL_PID}"
 exit 0
