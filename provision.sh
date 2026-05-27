@@ -44,6 +44,42 @@ MODEL_ID="${MODEL_ID:-Qwen/Qwen2.5-Coder-32B-Instruct-AWQ}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen-2.5-coder-32b}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 
+# vLLM `--max-model-len` cap on per-request prompt+completion tokens.
+# Chosen by GPU VRAM since Cursor regularly stuffs 16k+ tokens of
+# workspace context into a single chat completion (tested empirically
+# in Composer / Agent mode — overflow surfaces as
+# "This model's maximum context length is 16384 tokens" 400s).
+#
+# Per-token KV cache for Qwen 2.5 32B (GQA, 64 layers × 8 KV heads ×
+# 128 head_dim × fp16) ≈ 256 KiB. The model itself is ~18 GiB AWQ
+# INT4. Budget remaining at gpu_memory_utilization 0.90 is roughly
+# (vram_gib × 0.90) − 18; one full request needs max_len × 256 KiB.
+#
+#   24 GiB card  → ~3.6 GiB KV → ~14k tokens → 16k cap is safe ceiling
+#   40 GiB card  → ~18 GiB KV  → ~73k tokens → 32k is the model's
+#                                 native sweet spot, leaves >2x
+#                                 headroom for concurrent requests.
+#   80 GiB+ card → way more headroom; we still cap at 32k because
+#                  Qwen 2.5 32B's training context is 32k — beyond
+#                  that needs YaRN scaling and quality drops.
+#
+# Detected via nvidia-smi at runtime so a single provision.sh works
+# on the whole GPU lineup the customer-app filter (min_vram_gb=24 in
+# config/applications.php) might land us on, instead of forcing the
+# UI to either widen (kill cheap 4090 24G) or break Composer on small
+# cards.
+if command -v nvidia-smi >/dev/null 2>&1; then
+    GPU_VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 || echo 0)
+else
+    GPU_VRAM_MB=0
+fi
+if [ "${GPU_VRAM_MB:-0}" -ge 38000 ]; then
+    MAX_MODEL_LEN_DEFAULT=32768
+else
+    MAX_MODEL_LEN_DEFAULT=16384
+fi
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-$MAX_MODEL_LEN_DEFAULT}"
+
 # Where vLLM and supporting tooling get installed. /workspace persists across
 # Vast container restarts where /root does not, so prefer /workspace when it
 # exists.
@@ -246,9 +282,12 @@ report_stage start_server
 # Launch vLLM as a background process. Key flags:
 #   --api-key                 : require Authorization: Bearer <key> on every request
 #   --served-model-name       : the model identifier clients see (decoupled from $MODEL_ID)
-#   --max-model-len 16384     : Cursor + autocomplete don't push past 16k often.
-#                               Bigger context = more KV cache memory; 16k keeps
-#                               headroom on a 24 GB card.
+#   --max-model-len           : 16k on 24 GiB cards, 32k on 40 GiB+ — see
+#                               MAX_MODEL_LEN auto-detect block above.
+#                               Cursor's Composer regularly sends 16k+ tokens
+#                               of workspace context, so 16k works only as
+#                               a "tight floor" on 4090-class cards; 40 GiB+
+#                               hosts get the full Qwen-native 32k.
 #   --gpu-memory-utilization  : leave ~10% headroom so the AWQ kernel + cloudflared
 #                               + cc-agent don't OOM the card mid-session.
 #   --quantization awq_marlin : faster AWQ inference path on Ampere/Ada/Hopper.
@@ -268,7 +307,7 @@ nohup vllm serve "$MODEL_ID" \
     --port "$VLLM_PORT" \
     --api-key "$API_KEY" \
     --served-model-name "$SERVED_MODEL_NAME" \
-    --max-model-len 16384 \
+    --max-model-len "$MAX_MODEL_LEN" \
     --gpu-memory-utilization 0.90 \
     --quantization awq_marlin \
     --enable-auto-tool-choice \
