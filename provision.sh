@@ -24,6 +24,13 @@ set -euo pipefail
 CC_PROVISION_URL="${CC_PROVISION_URL:-}"
 CC_AGENT_TOKEN="${CC_AGENT_TOKEN:-}"
 
+# Tracks the stage we last *entered* so the trap-ERR handler below can
+# attribute an unexpected failure to the right manifest stage. Updated by
+# report_stage on every call. Initialized to the first stage so a crash
+# during the very first lines (before report_stage runs) still has a
+# sane stage to report.
+CC_CURRENT_STAGE="install_runtime"
+
 # Model + serving config. Defaults target Qwen 2.5 Coder 32B AWQ — a 32B-class
 # coding model quantized to INT4, peaks at ~22 GB VRAM, runs comfortably on a
 # single RTX 4090 / A6000. Override any of these by exporting the env var
@@ -59,11 +66,16 @@ TUNNEL_LOG="${LOG_DIR}/cloudflared.log"
 # a missed update is far preferable to crashing provisioning halfway
 # through.
 report_stage() {
+    local stage="$1"
+    shift
+    # Always update the stage tracker, even when reporting is disabled
+    # (no env vars). The trap-ERR handler still needs an accurate stage
+    # for its own log line in that case.
+    CC_CURRENT_STAGE="$stage"
+
     if [ -z "$CC_PROVISION_URL" ] || [ -z "$CC_AGENT_TOKEN" ]; then
         return 0
     fi
-    local stage="$1"
-    shift
     local extra=""
     for kv in "$@"; do
         extra="${extra},${kv}"
@@ -80,6 +92,64 @@ report_stage() {
 log() {
     echo "[cc-provision] $*"
 }
+
+# Sanitize an arbitrary string for inlining into a JSON value: strip CR,
+# fold newlines to spaces, and replace double-quotes with single-quotes.
+# Use this on every dynamic substring (log tails, error messages, command
+# names) before splicing into a `"message":"..."` payload, otherwise a
+# stray quote in the source produces invalid JSON and AgentProvisionController
+# 422s the request.
+json_escape() {
+    printf '%s' "$1" | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g'
+}
+
+# trap-ERR handler — fires for any command that fails under `set -e` and
+# wasn't already handled with explicit `report_stage ... "\"message\":...\""`
+# + `exit 1`. Without this, an unexpected failure (e.g. `pip install` 503,
+# `mkdir` -p on a read-only mount, a shell typo we never hit in testing)
+# kills the script silently. The backend then has nothing on
+# `provision_state.message` and only the 30-min OVERALL_TIMEOUT eventually
+# flips the instance to ERROR — a window where the user is billed for
+# nothing.
+#
+# Behaviour:
+#   1. Disable the trap immediately to prevent recursion if anything
+#      inside the handler also fails.
+#   2. Capture exit code, line, and the command text BEFORE doing any
+#      other work (later commands would clobber $? / $BASH_COMMAND).
+#   3. POST a fatal `message` tagged to CC_CURRENT_STAGE. The customer
+#      app's hasApplicationProvisioningFailed predicate picks this up
+#      on the next polling tick and flips the instance to ERROR with
+#      a clear message in seconds, not 30 minutes.
+#   4. Re-exit with the original code so anything downstream observes
+#      the same failure.
+handle_uncaught_error() {
+    # Capture $? BEFORE doing anything else — `trap - ERR`, `local`, and
+    # parameter assignment all clobber $?. We need the exit code of the
+    # actual failing command, which is what $? holds the moment trap
+    # fires.
+    local exit_code=$?
+    trap - ERR
+
+    local line_no="${1:-?}"
+    local command_text
+    command_text="$(json_escape "${2:-?}")"
+
+    log "uncaught error at line ${line_no} (stage=${CC_CURRENT_STAGE}, exit=${exit_code}): ${2:-?}"
+
+    report_stage "$CC_CURRENT_STAGE" \
+        "\"message\":\"Скрипт упал на line ${line_no}: ${command_text} (exit ${exit_code})\""
+
+    # Bash treats `exit 0` as success, but we got here BECAUSE something
+    # failed — fall back to 1 if the captured code somehow ended up 0
+    # (e.g. a `command not found` reported back as 127 by the shell but
+    # zero'd out by an unusual interaction).
+    if [ "$exit_code" -eq 0 ]; then
+        exit_code=1
+    fi
+    exit "$exit_code"
+}
+trap 'handle_uncaught_error "$LINENO" "$BASH_COMMAND"' ERR
 
 # Generate a random opaque API key in the form sk-cc-<32 hex>. vLLM treats it
 # as a single shared secret — it doesn't validate against anything, just
@@ -161,7 +231,7 @@ if ! huggingface-cli download "$MODEL_ID" \
     --cache-dir "$HF_HOME" \
     > "${LOG_DIR}/hf-download.log" 2>&1; then
     log "huggingface-cli download failed; see ${LOG_DIR}/hf-download.log"
-    tail_msg="$(tail -c 400 "${LOG_DIR}/hf-download.log" | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g')"
+    tail_msg="$(json_escape "$(tail -c 400 "${LOG_DIR}/hf-download.log")")"
     report_stage download_model "\"message\":\"HF download failed: ${tail_msg}\""
     exit 1
 fi
@@ -204,7 +274,7 @@ for _ in $(seq 1 "$VLLM_BIND_TIMEOUT_S"); do
     fi
     if ! kill -0 "$VLLM_PID" 2>/dev/null; then
         log "vLLM exited before binding port ${VLLM_PORT}"
-        tail_msg="$(tail -c 500 "$VLLM_LOG" | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g')"
+        tail_msg="$(json_escape "$(tail -c 500 "$VLLM_LOG")")"
         report_stage start_server "\"message\":\"vLLM crashed during startup: ${tail_msg}\""
         exit 1
     fi
@@ -223,41 +293,115 @@ fi
 # https://<words>.trycloudflare.com URL that proxies to our local
 # VLLM_PORT. The URL appears in cloudflared's own logs as
 # "Your quick Tunnel has been created! Visit it at:" followed by the URL
-# a couple lines later. We tail the log and grep until we see it.
+# a couple lines later.
+#
+# trycloudflare.com aggressively rate-limits new tunnel registrations from
+# the same egress IP — Vast hosts can hit HTTP 429 / Error 1015 within
+# seconds when the same datacenter recently spun up several quick
+# tunnels. The retry loop below ABSORBS those 429s with exponential
+# backoff instead of failing the whole instance launch. Tunnel creation
+# is idempotent on Cloudflare's side, each attempt gets a fresh URL.
 
 log "stage: open_tunnel"
 report_stage open_tunnel
 
-nohup "$CLOUDFLARED_BIN" tunnel \
-    --no-autoupdate \
-    --url "http://localhost:${VLLM_PORT}" \
-    > "$TUNNEL_LOG" 2>&1 &
-TUNNEL_PID=$!
-
 TUNNEL_URL=""
-TUNNEL_TIMEOUT_S=60
-for _ in $(seq 1 "$TUNNEL_TIMEOUT_S"); do
-    # The URL line in cloudflared's output looks like:
-    #   |  https://random-words.trycloudflare.com                                   |
-    # We grab the first matching trycloudflare.com URL — the banner repeats
-    # it a couple times but they're all the same value.
-    candidate="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" 2>/dev/null | head -n 1 || true)"
-    if [ -n "$candidate" ]; then
-        TUNNEL_URL="$candidate"
+# Per-attempt cap: long enough for cloudflared to either succeed or
+# reveal a 429, short enough that 4 attempts × this + backoff still
+# fits comfortably under APPLICATION_PROVISION_OVERALL_TIMEOUT_MINUTES
+# (30 min on the customer app side).
+TUNNEL_ATTEMPT_TIMEOUT_S=60
+TUNNEL_MAX_ATTEMPTS=4
+
+# open_tunnel_attempt — runs cloudflared once, watches its log, returns:
+#   0  TUNNEL_URL set and exported
+#   1  process died / no URL — caller may retry
+#   2  HTTP 429 / rate-limited — caller MUST back off before retrying
+open_tunnel_attempt() {
+    : > "$TUNNEL_LOG"
+
+    nohup "$CLOUDFLARED_BIN" tunnel \
+        --no-autoupdate \
+        --url "http://localhost:${VLLM_PORT}" \
+        > "$TUNNEL_LOG" 2>&1 &
+    local pid=$!
+
+    local elapsed=0
+    while [ "$elapsed" -lt "$TUNNEL_ATTEMPT_TIMEOUT_S" ]; do
+        local candidate
+        candidate="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" 2>/dev/null | head -n 1 || true)"
+        if [ -n "$candidate" ]; then
+            TUNNEL_URL="$candidate"
+            TUNNEL_PID="$pid"
+            return 0
+        fi
+
+        # 429 detection: cloudflared logs include "error code: 1015" and
+        # "429" in different lines depending on Cloudflare's response.
+        # Match either token to avoid relying on exact phrasing across
+        # cloudflared versions.
+        if grep -qE '(\b429\b|Too Many Requests|error code: ?1015)' "$TUNNEL_LOG" 2>/dev/null; then
+            log "cloudflared rate-limited (HTTP 429) on attempt"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return 2
+        fi
+
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log "cloudflared exited on attempt"
+            return 1
+        fi
+
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    # Timed out without URL or 429: kill and let caller retry.
+    log "cloudflared attempt timed out without URL"
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 1
+}
+
+# Disable trap-ERR for the retry block — we want a non-zero return from
+# open_tunnel_attempt to trigger our own retry logic, not the global
+# fatal handler. Re-enable on success / final-failure path so any
+# subsequent failure is still caught.
+trap - ERR
+TUNNEL_LAST_RC=1
+for attempt in $(seq 1 "$TUNNEL_MAX_ATTEMPTS"); do
+    log "cloudflared attempt ${attempt}/${TUNNEL_MAX_ATTEMPTS}"
+
+    open_tunnel_attempt
+    TUNNEL_LAST_RC=$?
+
+    if [ "$TUNNEL_LAST_RC" -eq 0 ]; then
         break
     fi
-    if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-        log "cloudflared exited before producing a tunnel URL"
-        tail_msg="$(tail -c 400 "$TUNNEL_LOG" | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g')"
-        report_stage open_tunnel "\"message\":\"cloudflared failed: ${tail_msg}\""
-        exit 1
+
+    if [ "$attempt" -lt "$TUNNEL_MAX_ATTEMPTS" ]; then
+        # Exponential backoff for 429, linear for generic failures —
+        # 429 is "trycloudflare hates this egress IP right now", needs
+        # real wall-clock time; a generic process death usually
+        # recovers on the next attempt without much wait.
+        if [ "$TUNNEL_LAST_RC" -eq 2 ]; then
+            sleep_for=$((30 * attempt))
+        else
+            sleep_for=$((5 * attempt))
+        fi
+        log "backing off ${sleep_for}s before retry"
+        sleep "$sleep_for"
     fi
-    sleep 1
 done
+trap 'handle_uncaught_error "$LINENO" "$BASH_COMMAND"' ERR
 
 if [ -z "$TUNNEL_URL" ]; then
-    log "cloudflared did not surface a URL within ${TUNNEL_TIMEOUT_S}s"
-    report_stage open_tunnel "\"message\":\"cloudflared did not produce a trycloudflare URL in ${TUNNEL_TIMEOUT_S}s\""
+    tail_msg="$(json_escape "$(tail -c 400 "$TUNNEL_LOG" 2>/dev/null || true)")"
+    if [ "$TUNNEL_LAST_RC" -eq 2 ]; then
+        report_stage open_tunnel "\"message\":\"cloudflared rate-limited (HTTP 429) by trycloudflare.com after ${TUNNEL_MAX_ATTEMPTS} retries: ${tail_msg}\""
+    else
+        report_stage open_tunnel "\"message\":\"cloudflared failed after ${TUNNEL_MAX_ATTEMPTS} retries: ${tail_msg}\""
+    fi
     exit 1
 fi
 
