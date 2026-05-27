@@ -252,6 +252,17 @@ report_stage start_server
 #   --gpu-memory-utilization  : leave ~10% headroom so the AWQ kernel + cloudflared
 #                               + cc-agent don't OOM the card mid-session.
 #   --quantization awq_marlin : faster AWQ inference path on Ampere/Ada/Hopper.
+#   --enable-auto-tool-choice + --tool-call-parser hermes :
+#       Cursor's Composer / Agent always sends `tool_choice: "auto"`
+#       on chat completions even when no tools are attached. Without
+#       these two flags vLLM 400s every such request with
+#       '"auto" tool choice requires --enable-auto-tool-choice and
+#       --tool-call-parser to be set'. Qwen 2.5 (including Coder)
+#       emits tool calls in the Hermes / ChatML <tool_call> format,
+#       so `hermes` is the correct parser. With these flags vLLM
+#       keeps accepting plain chat too (parser only kicks in when
+#       the model actually emits a tool call), so there's no
+#       downside for non-Agent users.
 nohup vllm serve "$MODEL_ID" \
     --host 0.0.0.0 \
     --port "$VLLM_PORT" \
@@ -260,6 +271,8 @@ nohup vllm serve "$MODEL_ID" \
     --max-model-len 16384 \
     --gpu-memory-utilization 0.90 \
     --quantization awq_marlin \
+    --enable-auto-tool-choice \
+    --tool-call-parser hermes \
     > "$VLLM_LOG" 2>&1 &
 VLLM_PID=$!
 
