@@ -45,40 +45,63 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen-2.5-coder-32b}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 
 # vLLM `--max-model-len` cap on per-request prompt+completion tokens.
-# Chosen by GPU VRAM since Cursor regularly stuffs 16k+ tokens of
-# workspace context into a single chat completion (tested empirically
-# in Composer / Agent mode — overflow surfaces as
-# "This model's maximum context length is 16384 tokens" 400s).
+# Chosen by GPU VRAM since Cursor (especially Composer / Agent) keeps
+# pushing the boundary: with the cap at 16k it 400'd at 16385, with
+# the cap at 32k it 400'd at 32769. Cursor's tokenizer (cl100k-style)
+# disagrees with Qwen's tokenizer by ~1 token, and Cursor itself has
+# no UI to override the per-model context cap, so the only fix is to
+# leave so much headroom that the off-by-one never reaches the wall.
 #
 # Per-token KV cache for Qwen 2.5 32B (GQA, 64 layers × 8 KV heads ×
 # 128 head_dim × fp16) ≈ 256 KiB. The model itself is ~18 GiB AWQ
-# INT4. Budget remaining at gpu_memory_utilization 0.90 is roughly
-# (vram_gib × 0.90) − 18; one full request needs max_len × 256 KiB.
+# INT4. Budget remaining at gpu_memory_utilization 0.92 is roughly
+# (vram_gib × 0.92) − 18; one full request needs max_len × 256 KiB.
 #
-#   24 GiB card  → ~3.6 GiB KV → ~14k tokens → 16k cap is safe ceiling
-#   40 GiB card  → ~18 GiB KV  → ~73k tokens → 32k is the model's
-#                                 native sweet spot, leaves >2x
-#                                 headroom for concurrent requests.
-#   80 GiB+ card → way more headroom; we still cap at 32k because
-#                  Qwen 2.5 32B's training context is 32k — beyond
-#                  that needs YaRN scaling and quality drops.
+#   24 GiB card  → ~4 GiB KV → ~16k tokens KV total → 16k cap is the
+#                  hard ceiling. YaRN-extending here would make vLLM
+#                  refuse to even start up.
+#   40 GiB+      → ~18 GiB+ KV → can hold a 65k single request with
+#                  ~1.1x concurrency. Sweet spot for one Cursor user
+#                  with a big workspace.
+#
+# 65k is reached via YaRN ×2 RoPE scaling (Qwen's native context is
+# 32k, beyond that requires explicit YaRN config + the
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 env escape hatch — vLLM refuses the
+# bigger max-model-len without it because un-scaled RoPE produces NaN
+# past max_position_embeddings). Quality cost on Qwen 2.5 32B
+# benchmarks is ~3-5% in the 32k-64k range — well below what
+# subjective Cursor usage notices.
 #
 # Detected via nvidia-smi at runtime so a single provision.sh works
 # on the whole GPU lineup the customer-app filter (min_vram_gb=24 in
-# config/applications.php) might land us on, instead of forcing the
-# UI to either widen (kill cheap 4090 24G) or break Composer on small
-# cards.
+# config/applications.php) lands us on.
 if command -v nvidia-smi >/dev/null 2>&1; then
     GPU_VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 || echo 0)
 else
     GPU_VRAM_MB=0
 fi
 if [ "${GPU_VRAM_MB:-0}" -ge 38000 ]; then
-    MAX_MODEL_LEN_DEFAULT=32768
+    MAX_MODEL_LEN_DEFAULT=65536
+    YARN_NEEDED=1
 else
     MAX_MODEL_LEN_DEFAULT=16384
+    YARN_NEEDED=0
 fi
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-$MAX_MODEL_LEN_DEFAULT}"
+
+# Build the YaRN args conditionally — passing rope_scaling on a
+# native-context launch (16k <= 32k) is harmless but the
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN env is only meaningful when we
+# actually exceed max_position_embeddings. Keep both gated to the
+# extended-context path so the 24 GiB launch line stays minimal.
+EXTRA_VLLM_ARGS=()
+if [ "$YARN_NEEDED" = "1" ]; then
+    export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+    EXTRA_VLLM_ARGS+=(
+        --hf-overrides
+        '{"rope_scaling":{"rope_type":"yarn","factor":2.0,"original_max_position_embeddings":32768}}'
+    )
+fi
 
 # Where vLLM and supporting tooling get installed. /workspace persists across
 # Vast container restarts where /root does not, so prefer /workspace when it
@@ -282,14 +305,14 @@ report_stage start_server
 # Launch vLLM as a background process. Key flags:
 #   --api-key                 : require Authorization: Bearer <key> on every request
 #   --served-model-name       : the model identifier clients see (decoupled from $MODEL_ID)
-#   --max-model-len           : 16k on 24 GiB cards, 32k on 40 GiB+ — see
-#                               MAX_MODEL_LEN auto-detect block above.
-#                               Cursor's Composer regularly sends 16k+ tokens
-#                               of workspace context, so 16k works only as
-#                               a "tight floor" on 4090-class cards; 40 GiB+
-#                               hosts get the full Qwen-native 32k.
-#   --gpu-memory-utilization  : leave ~10% headroom so the AWQ kernel + cloudflared
-#                               + cc-agent don't OOM the card mid-session.
+#   --max-model-len           : 16k on 24 GiB cards, 65k (YaRN ×2) on 40 GiB+ —
+#                               see MAX_MODEL_LEN auto-detect block above.
+#                               Cursor uses /v1/models max_model_len as its cap
+#                               and has no UI override; with 65k+ the model
+#                               can swallow whatever Cursor stuffs in.
+#   --gpu-memory-utilization  : 0.92 — squeeze ~2 extra GiB of KV cache out
+#                               of every host vs the original 0.90, AWQ kernels
+#                               and cloudflared still fit comfortably.
 #   --quantization awq_marlin : faster AWQ inference path on Ampere/Ada/Hopper.
 #   --enable-auto-tool-choice + --tool-call-parser hermes :
 #       Cursor's Composer / Agent always sends `tool_choice: "auto"`
@@ -308,10 +331,11 @@ nohup vllm serve "$MODEL_ID" \
     --api-key "$API_KEY" \
     --served-model-name "$SERVED_MODEL_NAME" \
     --max-model-len "$MAX_MODEL_LEN" \
-    --gpu-memory-utilization 0.90 \
+    --gpu-memory-utilization 0.92 \
     --quantization awq_marlin \
     --enable-auto-tool-choice \
     --tool-call-parser hermes \
+    "${EXTRA_VLLM_ARGS[@]}" \
     > "$VLLM_LOG" 2>&1 &
 VLLM_PID=$!
 
