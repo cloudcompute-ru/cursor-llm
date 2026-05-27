@@ -363,10 +363,25 @@ open_tunnel_attempt() {
     return 1
 }
 
-# Disable trap-ERR for the retry block — we want a non-zero return from
-# open_tunnel_attempt to trigger our own retry logic, not the global
-# fatal handler. Re-enable on success / final-failure path so any
-# subsequent failure is still caught.
+# Suppress both `set -e` AND the ERR trap for the retry block — we want
+# a non-zero return from open_tunnel_attempt to drive our retry/backoff
+# logic, NOT to kill the script.
+#
+# Why both: `trap - ERR` alone is NOT enough. `set -e` is what causes
+# the shell to exit on a non-zero return; the ERR trap is just the hook
+# that fires before the exit. Without `set +e` here, the very first
+# `open_tunnel_attempt` returning 2 (HTTP 429) immediately exits
+# provision.sh — silently, with no `report_stage open_tunnel
+# "...message..."` ever sent to the backend, so the user sits at
+# "stage: open_tunnel" until the backend's OVERALL_TIMEOUT (30 min)
+# eventually flips the instance to ERROR. This was observed in
+# production: a single 429 on attempt 1 killed the script before
+# attempts 2–4 could run.
+#
+# Re-enable both on the way out so any subsequent failure (e.g. inside
+# the report_stage block below) still gets caught by the global
+# fatal handler.
+set +e
 trap - ERR
 TUNNEL_LAST_RC=1
 for attempt in $(seq 1 "$TUNNEL_MAX_ATTEMPTS"); do
@@ -393,6 +408,7 @@ for attempt in $(seq 1 "$TUNNEL_MAX_ATTEMPTS"); do
         sleep "$sleep_for"
     fi
 done
+set -e
 trap 'handle_uncaught_error "$LINENO" "$BASH_COMMAND"' ERR
 
 if [ -z "$TUNNEL_URL" ]; then
